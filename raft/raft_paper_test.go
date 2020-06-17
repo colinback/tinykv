@@ -658,7 +658,7 @@ func TestFollowerAppendEntries2AB(t *testing.T) {
 		for _, ent := range tt.wents {
 			wents = append(wents, *ent)
 		}
-		if g := r.RaftLog.entries; !reflect.DeepEqual(g, wents) {
+		if g := r.RaftLog.allEntries(); !reflect.DeepEqual(g, wents) {
 			t.Errorf("#%d: ents = %+v, want %+v", i, g, wents)
 		}
 		var wunstable []pb.Entry
@@ -909,7 +909,8 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 	r.readMessages()
 	s.Append(r.RaftLog.unstableEntries())
 	r.RaftLog.applied = r.RaftLog.committed
-	r.RaftLog.stabled = r.RaftLog.LastIndex()
+	r.RaftLog.entries = r.RaftLog.entries[r.RaftLog.LastIndex()+1-r.RaftLog.stabled:]
+	r.RaftLog.stabled = r.RaftLog.LastIndex() + 1
 }
 
 func acceptAndReply(m pb.Message) pb.Message {

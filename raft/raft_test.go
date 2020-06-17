@@ -28,7 +28,8 @@ import (
 func nextEnts(r *Raft, s *MemoryStorage) (ents []pb.Entry) {
 	// Transfer all unstable entries to "stable" storage.
 	s.Append(r.RaftLog.unstableEntries())
-	r.RaftLog.stabled = r.RaftLog.LastIndex()
+	r.RaftLog.entries = r.RaftLog.entries[r.RaftLog.LastIndex()+1-r.RaftLog.stabled:]
+	r.RaftLog.stabled = r.RaftLog.LastIndex() + 1
 
 	ents = r.RaftLog.nextEnts()
 	r.RaftLog.applied = r.RaftLog.committed
@@ -167,7 +168,7 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	// term 3 at index 2).
 	for i := range n.peers {
 		sm := n.peers[i].(*Raft)
-		entries := sm.RaftLog.entries
+		entries := sm.RaftLog.allEntries()
 		if len(entries) != 2 {
 			t.Fatalf("node %d: len(entries) == %d, want 2", i, len(entries))
 		}

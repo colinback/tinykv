@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 
 	"github.com/pingcap-incubator/tinykv/log"
@@ -114,6 +115,42 @@ type Progress struct {
 	Match, Next uint64
 }
 
+func (pr *Progress) String() string {
+	return fmt.Sprintf("next = %d, match = %d", pr.Next, pr.Match)
+}
+
+func (pr *Progress) update(n uint64) {
+	if pr.Match < n {
+		pr.Match = n
+	}
+	if pr.Next < n+1 {
+		pr.Next = n + 1
+	}
+}
+
+// maybeDecrTo returns false if the given to index comes from an out of order message.
+// Otherwise it decreases the progress next index to min(rejected, last) and returns true.
+func (pr *Progress) maybeDecrTo(rejected, last uint64) bool {
+	if pr.Match != 0 {
+		// the rejection must be stale if the progress has matched and "rejected"
+		// is smaller than "match".
+		if rejected <= pr.Match {
+			return false
+		}
+		// directly decrease next to match + 1
+		pr.Next = pr.Match + 1
+		return true
+	}
+
+	// the rejection must be stale if "rejected" does not match next - 1
+	if pr.Next-1 != rejected {
+		return false
+	}
+
+	pr.Next = min(rejected, last+1)
+	return true
+}
+
 type Raft struct {
 	id uint64
 
@@ -163,6 +200,13 @@ type Raft struct {
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
 }
+
+// Uint64Slice implements sort interface
+type Uint64Slice []uint64
+
+func (p Uint64Slice) Len() int           { return len(p) }
+func (p Uint64Slice) Less(i, j int) bool { return p[i] < p[j] }
+func (p Uint64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 
 // newRaft return a raft peer with the given config
 func newRaft(c *Config) *Raft {
@@ -236,6 +280,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Term:    r.Term,
 		LogTerm: logTerm,
 		Index:   pr.Next - 1,
+		Entries: r.RaftLog.Entries(pr.Next),
 		Commit:  r.RaftLog.committed,
 	}
 
@@ -316,9 +361,11 @@ func (r *Raft) becomeLeader() {
 	r.reset(r.Term)
 	r.Lead = r.id
 	r.State = StateLeader
-	log.Infof("raft: %x became leader at term %d", r.id, r.Term)
 
 	// TODO: pendingConf
+
+	r.appendEntry(&pb.Entry{Data: nil})
+	log.Infof("raft: %x became leader at term %d", r.id, r.Term)
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -357,6 +404,16 @@ func (r *Raft) Step(m pb.Message) error {
 	switch r.State {
 	case StateFollower:
 		switch m.MsgType {
+		case pb.MessageType_MsgPropose:
+			if r.Lead == None {
+				log.Infof("raft: %x no leader at term %d; dropping proposal", r.id, r.Term)
+				return nil
+			}
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgPropose,
+				From:    r.id,
+				To:      r.Lead,
+			})
 		case pb.MessageType_MsgHeartbeat:
 			r.heartbeatElapsed = 0
 			r.Lead = m.From
@@ -408,6 +465,7 @@ func (r *Raft) Step(m pb.Message) error {
 				Reject:  true,
 			})
 		case pb.MessageType_MsgRequestVoteResponse:
+			log.Infof("Candidate receive MessageType_MsgRequestVoteResponse message")
 			gr := r.poll(m.From, !m.Reject)
 			log.Infof("raft: %x [q:%d] has received %d votes and %d vote rejections",
 				r.id, r.quorum(), gr, len(r.votes)-gr)
@@ -421,6 +479,30 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 	case StateLeader:
 		switch m.MsgType {
+		case pb.MessageType_MsgPropose:
+			if len(m.Entries) == 0 {
+				log.Panicf("raft: %x stepped empty MsgProp", r.id)
+			}
+			r.appendEntry(m.Entries...)
+			r.bcastAppend()
+		case pb.MessageType_MsgAppendResponse:
+			if m.Reject {
+				var li uint64
+				if len(m.Entries) != 0 {
+					li = m.Entries[0].Index
+				}
+				log.Infof("raft: %x received msgApp rejection(lastindex: %d) from %x for index %d",
+					r.id, li, m.From, m.Index)
+				if r.Prs[m.From].maybeDecrTo(m.Index, li) {
+					log.Infof("raft: %x decreased progress of %x to [%s]", r.id, m.From, r.Prs[m.From])
+					r.sendAppend(m.From)
+				}
+			} else {
+				r.Prs[m.From].update(m.Index)
+				if r.maybeCommit() {
+					r.bcastAppend()
+				}
+			}
 		case pb.MessageType_MsgBeat:
 			r.bcastHeartbeat()
 		case pb.MessageType_MsgHeartbeatResponse:
@@ -440,17 +522,38 @@ func (r *Raft) Step(m pb.Message) error {
 	return nil
 }
 
-// handleAppendEntries handle AppendEntries RPC request
+// Followers try append entries from Leader. If conflict is found, followers send reject message
+// including its last raft log
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	mlastIndex := m.Index + uint64(len(m.Entries))
-	r.msgs = append(r.msgs, pb.Message{
-		MsgType: pb.MessageType_MsgAppendResponse,
-		From:    r.id,
-		To:      m.From,
-		Term:    r.Term,
-		Index:   mlastIndex,
-	})
+	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			Index:   mlastIndex,
+		})
+	} else {
+		logTerm, err := r.RaftLog.Term(m.Index)
+		if err != nil {
+			panic(err)
+		}
+
+		log.Infof("raft: %x [logterm: %d, index: %d] rejected MessageType_MsgAppend [logterm: %d, index: %d] from %x",
+			r.id, logTerm, m.Index, m.LogTerm, m.Index, m.From)
+
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			Index:   m.Index,
+			Reject:  true,
+			Entries: r.RaftLog.Entries(max(r.RaftLog.LastIndex(), r.RaftLog.FirstIndex())),
+		})
+	}
+
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -578,4 +681,34 @@ func (r *Raft) bcastHeartbeat() {
 		}
 		r.sendHeartbeat(i)
 	}
+}
+
+func (r *Raft) appendEntry(entries ...*pb.Entry) {
+	li := r.RaftLog.LastIndex()
+	for i := range entries {
+		entries[i].Term = r.Term
+		entries[i].Index = li + 1 + uint64(i)
+	}
+
+	ents := make([]pb.Entry, 0)
+	for i := range entries {
+		ents = append(ents, *entries[i])
+	}
+	r.RaftLog.Append(ents...)
+
+	// update progress
+	r.Prs[r.id].update(r.RaftLog.LastIndex())
+
+	// commit
+	r.maybeCommit()
+}
+
+func (r *Raft) maybeCommit() bool {
+	mis := make(Uint64Slice, 0, len(r.Prs))
+	for i := range r.Prs {
+		mis = append(mis, r.Prs[i].Match)
+	}
+	sort.Sort(sort.Reverse(mis))
+	mci := mis[r.quorum()-1]
+	return r.RaftLog.maybeCommit(mci, r.Term)
 }
