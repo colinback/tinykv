@@ -248,6 +248,10 @@ func newRaft(c *Config) *Raft {
 		}
 	}
 
+	if !IsEmptyHardState(hs) {
+		r.loadState(hs)
+	}
+
 	// initilze as Follower
 	r.becomeFollower(r.Term, None)
 
@@ -711,4 +715,28 @@ func (r *Raft) maybeCommit() bool {
 	sort.Sort(sort.Reverse(mis))
 	mci := mis[r.quorum()-1]
 	return r.RaftLog.maybeCommit(mci, r.Term)
+}
+
+func (r *Raft) softState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+func (r *Raft) loadState(state pb.HardState) {
+	if state.Commit < r.RaftLog.committed || state.Commit > r.RaftLog.LastIndex() {
+		log.Panicf("raft: %x state.commit %d is out of range [%d, %d]", r.id, state.Commit, r.RaftLog.committed, r.RaftLog.LastIndex())
+	}
+	r.RaftLog.committed = state.Commit
+	r.Term = state.Term
+	r.Vote = state.Vote
 }

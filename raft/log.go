@@ -140,14 +140,8 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, nil
 	}
 
-	// return term of the entry at index i, if there is any
-	if i >= l.stabled && len(l.entries) != 0 {
-		last := l.stabled + uint64(len(l.entries)) - 1
-		if i <= last {
-			return l.entries[i-l.stabled].Term, nil
-		}
-
-		return 0, nil
+	if t, ok := l.maybeTerm(i); ok {
+		return t, nil
 	}
 
 	return l.storage.Term(i)
@@ -329,4 +323,49 @@ func (l *RaftLog) matchTerm(i, term uint64) bool {
 		return false
 	}
 	return lterm == term
+}
+
+func (l *RaftLog) maybeTerm(i uint64) (uint64, bool) {
+	if i < l.stabled {
+		return 0, false
+	}
+
+	if sz := len(l.entries); sz != 0 {
+		last := l.stabled + uint64(sz) - 1
+
+		if i > last {
+			return 0, false
+		}
+		return l.entries[i-l.stabled].Term, true
+	}
+
+	return 0, false
+}
+
+func (l *RaftLog) stableTo(i, t uint64) {
+	gt, ok := l.maybeTerm(i)
+	if !ok {
+		return
+	}
+
+	if gt == t && i >= l.stabled {
+		l.entries = l.entries[i+1-l.stabled:]
+		l.stabled = i + 1
+	}
+}
+
+func (l *RaftLog) stableSnapTo(i uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+		l.pendingSnapshot = nil
+	}
+}
+
+func (l *RaftLog) appliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+	if l.committed < i || i < l.applied {
+		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	}
+	l.applied = i
 }
